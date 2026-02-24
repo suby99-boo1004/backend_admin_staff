@@ -1,562 +1,2127 @@
 from __future__ import annotations
 
-"""
-Admin Staff Report Router (FIXED)
-
-- GET /api/admin/staff/report?unit=month|year&date=YYYY-MM|YYYY&user_id=1
-
-핵심:
-- 프로젝트 성과: project_evaluations(created_at) 기준으로 '평가가 존재하는 프로젝트'를 집계
-- 회사 총 사업 수: DISTINCT project_id
-- 회사 총 프로젝트 점수 합: SUM(contract_amount) / 10,000  (만원 단위)  ※ 대표님 기준
-- 참여 프로젝트 회사 점수 합: "프로젝트 최종 점수(P)" 합
-  P = (contract_amount/1,000,000) + project_period_days + difficulty + profit_rate_score + progress_step + participant_count
-  profit_rate_score는 projects.profit_rate가 있으면 사용, 없으면 (contract_amount - 비용합)/1,000,000 으로 계산
-- 개인 환산 점수: (P/10) * score(0~10)
-- 근태: attendance_records 기반(ENUM 안전 캐스팅)
-
-주의:
-- DB 컬럼이 버전별로 다를 수 있으므로, projects 컬럼은 존재할 때만 사용(없으면 0 처리)
-- 이번 패치는 "500 방지 + 대표님 기준 숫자 일치"를 우선
-"""
-
 import datetime as dt
+import json
 import math
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import text
+from app.modules.estimates.service import delete_estimate_with_revisions
 from sqlalchemy.orm import Session
 
 from app.core.deps import get_db, get_current_user
 from app.models.user import User
 
-router = APIRouter(prefix="/api/admin/staff", tags=["AdminStaff"])
+# =========================================================
+# 프로젝트(부서별업무) Router (STABLE CLEAN)
+# - Syntax 안정화 버전 (unmatched ')' 방지)
+# - 정책/기능: 기존 유지 + 아래만 추가
+#   1) 발주처 수기 입력(client_name) 지원 → clients 자동 생성/number 자동 증가
+#   2) 부서 미설정 계정 예외: payload.department_id 허용(등록 막힘 방지)
+#   3) 관리자 재무 저장: /{id}/admin-info (finance 테이블 없으면 400 안내)
+#   4) 상세조회: finance JOIN 실패 시 fallback (CREATE TABLE 절대 안함)
+# =========================================================
 
-ROLE_ADMIN_CODE = "ADMIN"
+router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 
-# -----------------------------------------------------------------------------
-# Helpers: schema probing
-# -----------------------------------------------------------------------------
-def _table_exists(db: Session, table: str) -> bool:
-    r = db.execute(
-        text(
-            """
-            SELECT 1 FROM information_schema.tables
-            WHERE table_schema='public' AND table_name=:t
+# --- project status enum helper (robust across DB enum values) ---
+def _get_project_status_enum_values(db):
+    """Return available enum labels for Postgres enum type project_status."""
+    try:
+        rows = db.execute(text("""
+            SELECT e.enumlabel
+            FROM pg_type t
+            JOIN pg_enum e ON t.oid = e.enumtypid
+            WHERE t.typname = 'project_status'
+            ORDER BY e.enumsortorder
+        """)).fetchall()
+        return [r[0] for r in rows] if rows else []
+    except Exception:
+        return []
+
+def _pick_status(db, preferred: list[str], fallback: str | None = None) -> str:
+    vals = _get_project_status_enum_values(db)
+    if vals:
+        for s in preferred:
+            if s in vals:
+                return s
+        # if fallback is valid, use it
+        if fallback and fallback in vals:
+            return fallback
+        # as a last resort, return the last enum value (often terminal)
+        return vals[-1]
+    # if enum lookup fails, just return first preferred or fallback
+    return fallback or (preferred[0] if preferred else "IN_PROGRESS")
+ROLE_ADMIN_ID = 6
+
+def _get_cancel_reason(db: Session, project_id: int) -> Optional[str]:
+    """취소 사유 반환.
+    - projects.cancel_reason 컬럼이 있으면 그 값을 사용
+    - 없으면 project_updates의 '[취소사유] ...' 최신 1건을 사용
+    """
+    # 1) projects.cancel_reason 컬럼이 있는 DB
+    try:
+        if _column_exists(db, "projects", "cancel_reason"):
+            v = db.execute(text("SELECT cancel_reason FROM projects WHERE id = :id"), {"id": project_id}).scalar()
+            if v:
+                return str(v).strip() or None
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+    # 2) fallback: project_updates
+    try:
+        v = db.execute(
+            text(
+                f"""
+                SELECT content
+                FROM project_updates
+                WHERE project_id = :pid AND content ILIKE '[취소사유] %'
+                ORDER BY id DESC
+                LIMIT 1
+                """
+            ),
+            {"pid": project_id},
+        ).scalar()
+        if not v:
+            return None
+        s = str(v).strip()
+        if s.startswith("[취소사유] "):
+            s = s.replace("[취소사유] ", "", 1).strip()
+        return s or None
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
+
+ROLE_OPERATOR_ID = 7
+
+
+def _role_id(user: Any) -> Optional[int]:
+    rid = getattr(user, "role_id", None)
+    try:
+        return int(rid) if rid is not None else None
+    except Exception:
+        return None
+
+
+
+def _has_column(db: Session, table: str, column: str) -> bool:
+    """PostgreSQL에서 특정 테이블에 컬럼이 존재하는지 확인"""
+    try:
+        q = text("""
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_name = :t AND column_name = :c
             LIMIT 1
-            """
-        ),
-        {"t": table},
-    ).first()
-    return r is not None
+        """)
+        return db.execute(q, {"t": table, "c": column}).scalar() is not None
+    except Exception:
+        return False
 
-
-def _col_exists(db: Session, table: str, col: str) -> bool:
-    r = db.execute(
-        text(
-            """
-            SELECT 1 FROM information_schema.columns
-            WHERE table_schema='public' AND table_name=:t AND column_name=:c
-            LIMIT 1
-            """
-        ),
-        {"t": table, "c": col},
-    ).first()
-    return r is not None
-
-
-def _is_admin_db(db: Session, user: User) -> bool:
-    role_id = getattr(user, "role_id", None)
+def _is_admin_by_code(db: Session, user: User) -> bool:
+    """관리자 판정(안전):
+    - role_id == ROLE_ADMIN_ID(=6) 이면 관리자
+    - roles.code 가 ADMIN 이면 관리자(대소문자 무시)
+    """
+    role_id = _role_id(user)
     if not role_id:
         return False
-    code = db.execute(text("SELECT code FROM roles WHERE id = :id"), {"id": role_id}).scalar()
-    return code == ROLE_ADMIN_CODE
+    try:
+        if int(role_id) == int(ROLE_ADMIN_ID):
+            return True
+    except Exception:
+        pass
+    try:
+        code = db.execute(text("SELECT code FROM roles WHERE id = :id"), {"id": role_id}).scalar()
+        return str(code or "").strip().upper() == "ADMIN"
+    except Exception:
+        return False
 
 
-def _require_admin(db: Session, user: Optional[User]) -> User:
+def _get_participant_scores(db: Session, project_id: int, can_view_scores: bool, *, project_status: Optional[str] = None) -> List[ParticipantScoreOut]:
+    """
+    프로젝트 참여자 점수 조회.
+    - 기준 테이블: project_evaluations (존재 시) → project_participants(존재 시)
+    - 프로젝트가 완료 상태가 아니면(사업완료 전) 빈 리스트 반환하여 '유령 참여자수'를 방지
+    """
+    status_u = (project_status or "").strip().upper()
+    completed = status_u in {"DONE", "COMPLETED", "COMPLETE", "FINISHED", "CLOSED"}
+    if project_status is not None and not completed:
+        return []
+
+    rows = []
+    # 1) project_evaluations 우선
+    if _table_exists(db, "project_evaluations"):
+        try:
+            rows = db.execute(
+                text(
+                    """
+                    SELECT
+                      pe.user_id AS employee_id,
+                      u.name AS employee_name,
+                      pe.score AS score
+                    FROM project_evaluations pe
+                    LEFT JOIN users u ON u.id = pe.user_id
+                    WHERE pe.project_id = :pid
+                    ORDER BY pe.user_id ASC
+                    """
+                ),
+                {"pid": project_id},
+            ).mappings().all()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            rows = []
+
+    # 2) 하위호환: project_participants
+    if (not rows) and _table_exists(db, "project_participants"):
+        try:
+            rows = db.execute(
+                text(
+                    """
+                    SELECT
+                      pp.employee_id AS employee_id,
+                      e.name AS employee_name,
+                      pp.score AS score
+                    FROM project_participants pp
+                    LEFT JOIN employees e ON e.id = pp.employee_id
+                    WHERE pp.project_id = :pid
+                    ORDER BY pp.employee_id ASC
+                    """
+                ),
+                {"pid": project_id},
+            ).mappings().all()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            rows = []
+
+    out: List[ParticipantScoreOut] = []
+    for r in rows or []:
+        out.append(
+            ParticipantScoreOut(
+                employee_id=int(r["employee_id"]),
+                employee_name=r.get("employee_name"),
+                score=(float(r["score"]) if (can_view_scores and r.get("score") is not None) else None),
+            )
+        )
+    return out
+
+
+
+def _require_login(user: Optional[User]) -> User:
     if not user:
         raise HTTPException(status_code=401, detail="로그인이 필요합니다.")
-    if not _is_admin_db(db, user):
+    return user
+
+
+def _require_admin(user: Optional[User]) -> User:
+    user = _require_login(user)
+    if getattr(user, "role_id", None) != ROLE_ADMIN_ID:
         raise HTTPException(status_code=403, detail="관리자 권한이 필요합니다.")
     return user
 
 
-def _period_range(unit: str, date_str: str) -> Tuple[dt.datetime, dt.datetime]:
-    # 내부는 [start, end) (exclusive end)
-    if unit == "month":
-        if len(date_str) != 7:
-            raise HTTPException(status_code=400, detail="month는 date=YYYY-MM 형식이어야 합니다.")
-        y = int(date_str[:4])
-        m = int(date_str[5:7])
-        start = dt.datetime(y, m, 1, 0, 0, 0)
-        if m == 12:
-            end = dt.datetime(y + 1, 1, 1, 0, 0, 0)
-        else:
-            end = dt.datetime(y, m + 1, 1, 0, 0, 0)
-        return start, end
-    if unit == "year":
-        if len(date_str) != 4:
-            raise HTTPException(status_code=400, detail="year는 date=YYYY 형식이어야 합니다.")
-        y = int(date_str)
-        return dt.datetime(y, 1, 1, 0, 0, 0), dt.datetime(y + 1, 1, 1, 0, 0, 0)
-    raise HTTPException(status_code=400, detail="unit은 month|year 중 하나여야 합니다.")
+def _normalize_year(year: Optional[int]) -> Optional[int]:
+    if year is None:
+        return None
+    if year < 2000 or year > 2100:
+        raise HTTPException(status_code=400, detail="year 값이 올바르지 않습니다.")
+    return year
 
 
-# -----------------------------------------------------------------------------
+# ----------------------
 # Schemas
-# -----------------------------------------------------------------------------
-class PerformanceSummary(BaseModel):
-    company_project_count: int = 0
-    company_project_score_sum: float = 0.0  # 회사 전체 final_score 합
-    employee_project_count: int = 0
-    employee_project_score_sum: float = 0.0  # P 합
-    employee_allocated_score_sum: float = 0.0
-    employee_share_percent: float = 0.0
+# ----------------------
+
+class DepartmentMeta(BaseModel):
+    id: int
+    code: Optional[str] = None
+    name: str
+    sort_order: int = 0
+    in_progress_count: int = 0
 
 
-class AttendanceSummary(BaseModel):
-    total_days: int = 0
-    actual_work_days: int = 0
-    total_work_hours: float = 0.0
-    avg_work_hours: float = 0.0
-
-    office_days: int = 0
-    offsite_days: int = 0
-    annual_leave_days: float = 0.0
-    half_leave_days: float = 0.0
-    overtime_days: int = 0
-    holiday_work_days: int = 0
-    extra_work_days: int = 0
+class ClientMeta(BaseModel):
+    id: int
+    name: str
+    number: int = 0
 
 
-class ProjectRow(BaseModel):
-    project_id: int
-    project_name: str
-    evaluated_at: dt.datetime
-    project_final_score: float  # 프로젝트 총점(최종 점수)
-    personal_score: float       # 개인 평가 점수(0~10)
-    allocated_score: float      # 환산 점수
-    score_source: str           # 'SNAPSHOT' | 'LIVE'
+class BusinessTypeMeta(BaseModel):
+    id: int
+    name: str
+    number: int = 0
 
 
-class StaffReportOut(BaseModel):
-    unit: str
-    date: str
-    user_id: int
-    employee_name: str
+class ClientUpsert(BaseModel):
+    name: str = Field(..., min_length=1)
+    number: int = 0
+    sort_order: int = 0
+    is_active: bool = True
+    memo: Optional[str] = None
+
+
+class BusinessTypeUpsert(BaseModel):
+    name: str = Field(..., min_length=1)
+    number: int = 0
+    sort_order: int = 0
+    is_active: bool = True
+    memo: Optional[str] = None
+
+
+class ClientPatch(BaseModel):
+    name: Optional[str] = Field(None, min_length=1)
+    number: Optional[int] = None
+
+
+class BusinessTypePatch(BaseModel):
+    name: Optional[str] = Field(None, min_length=1)
+    number: Optional[int] = None
+
+
+class ProjectListItem(BaseModel):
+    id: int
+    name: str
+    department_id: Optional[int] = None
     department_name: Optional[str] = None
-    performance: PerformanceSummary
-    attendance: AttendanceSummary
-    projects: List[ProjectRow]
+    client_id: Optional[int] = None
+    client_name: Optional[str] = None
+    status: str
+    has_unread_update: bool = False
+    start_date: Optional[dt.date] = None
+    end_date: Optional[dt.date] = None
+    due_date: Optional[dt.date] = None  # 프론트 호환(alias)
+    created_at: Optional[dt.datetime] = None
 
 
-# -----------------------------------------------------------------------------
-# Core: employee info
-# -----------------------------------------------------------------------------
-def _load_employee_info(db: Session, user_id: int) -> Tuple[str, Optional[str]]:
-    row = db.execute(
-        text(
-            """
-            SELECT u.name AS name, d.name AS department_name
-            FROM users u
-            LEFT JOIN departments d ON d.id = u.department_id
-            WHERE u.id = :uid
-            """
-        ),
-        {"uid": user_id},
-    ).mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="사용자를 찾을 수 없습니다.")
-    return str(row.get("name") or f"#{user_id}"), row.get("department_name")
+class ProjectCreate(BaseModel):
+    name: str = Field(..., min_length=1)
+    department_id: Optional[int] = None
+    client_id: Optional[int] = None
+    client_name: Optional[str] = None  # ✅ 수기 발주처 입력
+    business_type_id: Optional[int] = None
+    status: Optional[str] = None  # enum 문자열 (예: PLANNING, IN_PROGRESS)
+    start_date: Optional[dt.date] = None
+    end_date: Optional[dt.date] = None
+    memo: Optional[str] = None
 
 
-# -----------------------------------------------------------------------------
-# Core: project performance (project_evaluations 기준)
-# -----------------------------------------------------------------------------
-def _select_expr(db: Session, col: str, default_sql: str = "0") -> str:
-    # projects.<col> 이 있으면 COALESCE(p.col,0) 형태로 반환, 없으면 default_sql
-    if _col_exists(db, "projects", col):
-        return f"COALESCE(p.{col}, 0)"
-    return default_sql
+class ProjectAdminInfo(BaseModel):
+    # ✅ 관리자 프로젝트 정보(최종점수 산출에 필요한 값 포함)
+    # 프론트(ProjectDetailPage)에서 admin-info 저장 시 보내는 필드들을 그대로 받는다.
+    contract_amount: Optional[float] = None
+
+    # 최종점수 산출 필드(있으면 projects에 저장)
+    project_period_days: Optional[float] = None
+    project_period: Optional[str] = None
+    difficulty: Optional[float] = None
+    progress_step: Optional[float] = None
+    participant_count: Optional[float] = None
+    profit_rate: Optional[float] = None  # 프론트는 점수(= profitRateScore)를 보냄
+
+    # ✅ 추가 점수(프로젝트 평가 확장)
+    sales_score: Optional[float] = None
+    work_speed: Optional[float] = None
+    internal_score: Optional[float] = None
+    external_score: Optional[float] = None
+
+    # 비용/메모 (기존 + 확장)
+    cost_material: Optional[float] = None
+    cost_labor: Optional[float] = None
+    cost_office: Optional[float] = None
+    cost_progress: Optional[float] = None
+    cost_other: Optional[float] = None
+    sales_cost: Optional[float] = None
+
+    cost_other_note: Optional[str] = None
+    other_note: Optional[str] = None
 
 
-def _trunc1(x: float) -> float:
-    # 소수 2째자리 이하는 버림(=소수 1자리까지)
+# ----------------------
+# Meta APIs
+# ----------------------
+
+
+
+class ProjectPatch(BaseModel):
+    name: Optional[str] = Field(None, min_length=1)
+    client_id: Optional[int] = None
+    client_name: Optional[str] = None  # 수기 발주처(이름) → clients upsert
+    business_type_id: Optional[int] = None
+    memo: Optional[str] = None
+    created_by_id: Optional[int] = None  # 관리자만 변경 가능
+
+
+def _can_edit_project(db: Session, project_id: int, user: User) -> bool:
+    rid = _role_id(user)
+    is_admin = _is_admin_by_code(db, user) or rid == ROLE_ADMIN_ID
+    if is_admin:
+        return True
+    created_by = db.execute(text("SELECT created_by FROM projects WHERE id = :id"), {"id": project_id}).scalar()
     try:
-        return math.trunc(float(x) * 10.0) / 10.0
+        return int(created_by or 0) == int(user.id)
     except Exception:
-        return 0.0
+        return False
 
 
-def _calc_final_score_row(db: Session, r: Dict[str, Any]) -> float:
-    """프로젝트 상세페이지의 '프로젝트 평가 총점수'와 동일 규칙.
 
-    - 영업점수(sales_score)
-    - 사업기간(project_period_days)
-    - 사업난이도(difficulty)
-    - 진행과정(progress_step)
-    - 업무진행속도(work_speed)
-    - 내부진행점수(internal_score)
-    - 외부평가점수(external_score)
-    - 참여자수(participant_count)
-    - 수익률(금액)(profit_rate)  # 점수로 저장된 값
-    합계 후 소수 1자리까지, 2째자리 이하는 버림.
-    """
-    sales_score = float(r.get("sales_score") or 0.0)
-    project_period_days = float(r.get("project_period_days") or 0.0)
-    difficulty = float(r.get("difficulty") or 0.0)
-    progress_step = float(r.get("progress_step") or 0.0)
-    work_speed = float(r.get("work_speed") or 0.0)
-    internal_score = float(r.get("internal_score") or 0.0)
-    external_score = float(r.get("external_score") or 0.0)
-    participant_count = float(r.get("participant_count") or 0.0)
-    profit_rate_score = float(r.get("profit_rate") or 0.0)
+@router.patch("/{project_id}", response_model=Dict[str, Any])
+def update_project_info(
+    project_id: int,
+    payload: ProjectPatch,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    user = _require_login(current_user)
 
-    total = (
-        sales_score
-        + project_period_days
-        + difficulty
-        + progress_step
-        + work_speed
-        + internal_score
-        + external_score
-        + participant_count
-        + profit_rate_score
-    )
-    return _trunc1(total)
+    exists = db.execute(text("SELECT 1 FROM projects WHERE id = :id"), {"id": project_id}).first()
+    if not exists:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
+
+    if not _can_edit_project(db, project_id, user):
+        raise HTTPException(status_code=403, detail="수정 권한이 없습니다.")
+
+    fields: List[str] = []
+    params: Dict[str, Any] = {"id": project_id}
+
+    if payload.name is not None:
+        fields.append("name = :name")
+        params["name"] = payload.name.strip()
+
+    if payload.business_type_id is not None:
+        fields.append("business_type_id = :business_type_id")
+        params["business_type_id"] = payload.business_type_id
+
+    if payload.memo is not None:
+        fields.append("memo = :memo")
+        params["memo"] = payload.memo
+
+    # 발주처: client_id 우선, 없으면 client_name으로 upsert
+    if payload.client_id is not None:
+        fields.append("client_id = :client_id")
+        params["client_id"] = payload.client_id
+    elif payload.client_name is not None:
+        cname = payload.client_name.strip()
+        if cname:
+            row_c = db.execute(text("SELECT id FROM clients WHERE name = :name"), {"name": cname}).first()
+            if row_c:
+                cid = row_c[0]
+            else:
+                next_number = db.execute(text("SELECT COALESCE(MAX(number), 0) + 1 FROM clients")).scalar() or 1
+                row_new = db.execute(
+                    text("INSERT INTO clients (name, number) VALUES (:name, :number) RETURNING id"),
+                    {"name": cname, "number": int(next_number)},
+                ).first()
+                cid = row_new[0]
+            fields.append("client_id = :client_id")
+            params["client_id"] = int(cid)
+
+    # 등록자 변경: 관리자만 허용
+    if payload.created_by_id is not None:
+        rid = _role_id(user)
+        is_admin = _is_admin_by_code(db, user) or rid == ROLE_ADMIN_ID
+        if not is_admin:
+            raise HTTPException(status_code=403, detail="등록자 변경은 관리자만 가능합니다.")
+        fields.append("created_by = :created_by")
+        params["created_by"] = int(payload.created_by_id)
+
+    if not fields:
+        raise HTTPException(status_code=400, detail="변경할 값이 없습니다.")
+
+    # updated_at 컬럼이 없을 수도 있으니, 안전하게 2단계 시도
+    try:
+        db.execute(
+            text(f"UPDATE projects SET {', '.join(fields)}, updated_at = NOW() WHERE id = :id"),
+            params,
+        )
+    except Exception:
+        db.execute(
+            text(f"UPDATE projects SET {', '.join(fields)} WHERE id = :id"),
+            params,
+        )
+
+    db.commit()
+    return {"ok": True}
 
 
-    project_period_days = float(r.get("project_period_days") or 0.0)
-    difficulty = float(r.get("difficulty") or 0.0)
-    progress_step = float(r.get("progress_step") or 0.0)
-    participant_count = float(r.get("participant_count") or 0.0)
+@router.get("/meta/departments", response_model=List[DepartmentMeta])
+def list_departments(
+    year: Optional[int] = Query(None, description="연도(예: 2026)"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> List[DepartmentMeta]:
+    _require_login(current_user)
+    y = _normalize_year(year)
 
-    # profit_rate_score:
-    # 1) projects.profit_rate가 있으면(점수로 저장되는 값) 그걸 사용
-    pr = r.get("profit_rate")
-    if pr is not None:
-        profit_rate_score = float(pr or 0.0)
-    else:
-        # 2) 없으면 (수주 - 비용합) / 1,000,000
-        cost_sum = float(r.get("cost_sum") or 0.0)
-        profit_rate_score = (contract_amount - cost_sum) / 1_000_000.0
-
-    final_score = project_period_days + difficulty + profit_rate_score + progress_step + participant_count
-    # 프론트처럼 소수 1자리 느낌으로(여기서는 1자리까지 반올림)
-    return round(final_score, 1)
-
-
-def _calc_project_performance(db: Session, user_id: int, start_dt: dt.datetime, end_dt: dt.datetime) -> Tuple[PerformanceSummary, List[ProjectRow]]:
-    if not _table_exists(db, "project_evaluations"):
-        return PerformanceSummary(), []
-
-    # 1) 회사 기준 프로젝트 목록
-    # 기본은 '사업 완료' 시점을 기준으로 집계 (가능하면 completed_at 기준)
-    if _col_exists(db, "projects", "completed_at"):
-        proj_rows = db.execute(
-            text(
-                """
-                SELECT p.id AS project_id
-                FROM projects p
-                WHERE p.completed_at >= :s AND p.completed_at < :e
-                """
-            ),
-            {"s": start_dt, "e": end_dt},
-        ).mappings().all()
-    else:
-        # fallback: 완료시각 컬럼이 없는 경우, 평가가 생성된 시점 기준(기존 방식)
-        proj_rows = db.execute(
-            text(
-                """
-                SELECT DISTINCT pe.project_id
-                FROM project_evaluations pe
-                WHERE pe.created_at >= :s AND pe.created_at < :e
-                """
-            ),
-            {"s": start_dt, "e": end_dt},
-        ).mappings().all()
-
-    proj_ids = [int(r["project_id"]) for r in proj_rows]
-    if not proj_ids:
-        return PerformanceSummary(), []
-
-    # 2) projects 필요한 컬럼을 "존재할 때만" SELECT 하도록 구성
-    # 비용 컬럼: 없으면 0으로 cost_sum 계산
-    cost_material = _select_expr(db, "cost_material", "0")
-    cost_labor = _select_expr(db, "cost_labor", "0")
-    cost_office = _select_expr(db, "cost_office", "0")
-    cost_other = _select_expr(db, "cost_other", "0")
-    sales_cost = _select_expr(db, "sales_cost", "0")
-    cost_progress = _select_expr(db, "cost_progress", "0")
-
-    sales_score = _select_expr(db, "sales_score", "0")
-    work_speed = _select_expr(db, "work_speed", "0")
-    internal_score = _select_expr(db, "internal_score", "0")
-    external_score = _select_expr(db, "external_score", "0")
-
-    project_period_days = _select_expr(db, "project_period_days", "0")
-    difficulty = _select_expr(db, "difficulty", "0")
-    progress_step = _select_expr(db, "progress_step", "0")
-    participant_count = _select_expr(db, "participant_count", "0")
-
-    # profit_rate는 있을 수도/없을 수도
-    profit_rate_expr = "p.profit_rate" if _col_exists(db, "projects", "profit_rate") else "NULL"
-
-    select_sql = f"""
-        SELECT
-          p.id,
-          p.name,
-          COALESCE(p.contract_amount,0)::float AS contract_amount,
-          ({cost_material}+{cost_labor}+{cost_office}+{cost_other}+{sales_cost}+{cost_progress})::float AS cost_sum,
-          {sales_score}::float AS sales_score,
-          {project_period_days}::float AS project_period_days,
-          {difficulty}::float AS difficulty,
-          {progress_step}::float AS progress_step,
-          {work_speed}::float AS work_speed,
-          {internal_score}::float AS internal_score,
-          {external_score}::float AS external_score,
-          {participant_count}::float AS participant_count,
-          {profit_rate_expr} AS profit_rate
-        FROM projects p
-        WHERE p.id = ANY(:ids)
-    """
-
-    # 3) 회사 총 프로젝트 점수 합: final_score 합 (※ contract_amount/1,000,000 항목은 이미 final_score에서 제외됨)
-    all_rows = db.execute(text(select_sql), {"ids": proj_ids}).mappings().all()
-    all_map = {int(r["id"]): dict(r) for r in all_rows}
-    # 3-A) 사업완료 스냅샷(있으면) 우선 사용: 프로젝트 총점(final_project_score) / 완료시각(completed_at)
-    snap_map: Dict[int, Dict[str, Any]] = {}
-    item_map: Dict[int, Dict[str, float]] = {}
-    if _table_exists(db, "project_completion_snapshots"):
-        snap_rows = db.execute(
-            text(
-                """
-                SELECT project_id,
-                       COALESCE(final_project_score,0)::float AS final_project_score,
-                       completed_at
-                FROM project_completion_snapshots
-                WHERE is_active = true
-                  AND project_id = ANY(:ids)
-                """
-            ),
-            {"ids": proj_ids},
-        ).mappings().all()
-
-        for sr in snap_rows:
-            pid0 = int(sr["project_id"])
-            snap_map[pid0] = {
-                "final_project_score": float(sr.get("final_project_score") or 0.0),
-                "completed_at": sr.get("completed_at"),
-            }
-
-        # 직원(본인) 스냅샷 아이템: user_eval_score / converted_score
-        if snap_map and _table_exists(db, "project_completion_snapshot_items"):
-            item_rows = db.execute(
-                text(
-                    """
-                    SELECT pcs.project_id,
-                           COALESCE(psi.user_eval_score,0)::float AS user_eval_score,
-                           COALESCE(psi.converted_score,0)::float AS converted_score
-                    FROM project_completion_snapshot_items psi
-                    JOIN project_completion_snapshots pcs ON pcs.id = psi.snapshot_id
-                    WHERE pcs.is_active = true
-                      AND pcs.project_id = ANY(:ids)
-                      AND psi.user_id = :uid
-                    """
-                ),
-                {"ids": proj_ids, "uid": user_id},
-            ).mappings().all()
-
-            for ir in item_rows:
-                pid1 = int(ir["project_id"])
-                item_map[pid1] = {
-                    "user_eval_score": float(ir.get("user_eval_score") or 0.0),
-                    "converted_score": float(ir.get("converted_score") or 0.0),
-                }
-
-    company_P_sum = 0.0
-    for rr in all_map.values():
-        pid0 = int(rr["id"])
-        if pid0 in snap_map:
-            company_P_sum += float(snap_map[pid0]["final_project_score"] or 0.0)
-        else:
-            company_P_sum += float(_calc_final_score_row(db, rr) or 0.0)
-    company_score_sum = _trunc1(company_P_sum)
-
-    # 4) 사용자가 평가한 프로젝트(해당 기간, 최신 평가 1건/프로젝트)
-    user_eval = db.execute(
+    dept_rows = db.execute(
         text(
             """
-            SELECT DISTINCT ON (pe.project_id)
-              pe.project_id,
-              pe.created_at,
-              COALESCE(pe.score,0)::float AS score
-            FROM project_evaluations pe
-            WHERE pe.user_id = :uid
-              AND pe.created_at >= :s AND pe.created_at < :e
-            ORDER BY pe.project_id, pe.created_at DESC, pe.id DESC
+            SELECT id, code, name, COALESCE(sort_order,0) AS sort_order
+            FROM departments
+            ORDER BY COALESCE(sort_order,0) ASC, id ASC
             """
-        ),
-        {"uid": user_id, "s": start_dt, "e": end_dt},
+        )
     ).mappings().all()
 
-    user_proj_ids = [int(r["project_id"]) for r in user_eval]
-    if not user_proj_ids:
-        # 회사 값만, 직원 값은 0
-        return PerformanceSummary(company_project_count=len(proj_ids), company_project_score_sum=company_score_sum), []
+    where_year = ""
+    params: Dict[str, Any] = {}
+    if y is not None:
+        where_year = "AND EXTRACT(YEAR FROM COALESCE(p.start_date, p.created_at)) = :y"
+        params["y"] = y
 
-    # 5) 프로젝트 리스트 + 합계
-    projects_out: List[ProjectRow] = []
-    emp_score_sum = 0.0  # 참여 프로젝트 P 합
-    alloc_sum = 0.0
+    cnt_rows = db.execute(
+        text(
+            f"""
+            SELECT p.department_id AS department_id, COUNT(*) AS cnt
+            FROM projects p
+            WHERE p.department_id IS NOT NULL
+              AND p.status IN ('PLANNING','IN_PROGRESS','ON_HOLD')
+              {where_year}
+            GROUP BY p.department_id
+            """
+        ),
+        params,
+    ).mappings().all()
 
-    for ue in user_eval:
-        pid = int(ue["project_id"])
-        base = all_map.get(pid)
-        if not base:
-            continue
-        if pid in snap_map:
-            # 사업완료 스냅샷이 있으면: 프로젝트 총점=final_project_score, 환산점수=converted_score(없으면 산식으로 계산)
-            P = float(snap_map[pid]["final_project_score"] or 0.0)
-            score = float(item_map.get(pid, {}).get("user_eval_score", ue.get("score") or 0.0) or 0.0)
-            alloc = float(item_map.get(pid, {}).get("converted_score", _trunc1((P / 10.0) * score)) or 0.0)
-        else:
-            P = float(_calc_final_score_row(db, base) or 0.0)
-            score = float(ue.get("score") or 0.0)
-            alloc = _trunc1((P / 10.0) * score)
+    cnt_map = {int(r["department_id"]): int(r["cnt"]) for r in cnt_rows}
 
-        projects_out.append(
-            ProjectRow(
-                project_id=pid,
-                project_name=str(base.get("name") or f"#{pid}"),
-                evaluated_at=(snap_map.get(pid, {}).get("completed_at") if pid in snap_map else ue["created_at"]),
-                project_final_score=P,
-                personal_score=score,
-                allocated_score=alloc,
-                score_source=("SNAPSHOT" if pid in snap_map else "LIVE"),
+    out: List[DepartmentMeta] = []
+    for r in dept_rows:
+        did = int(r["id"])
+        out.append(
+            DepartmentMeta(
+                id=did,
+                code=r.get("code"),
+                name=r.get("name"),
+                sort_order=int(r.get("sort_order") or 0),
+                in_progress_count=cnt_map.get(did, 0),
             )
         )
-        emp_score_sum += P
-        alloc_sum += alloc
+    return out
 
-    # 개인이 참여한 프로젝트에서의 점유율(%): alloc_sum / emp_score_sum
-    share = 0.0 if emp_score_sum <= 0 else _trunc1((alloc_sum / emp_score_sum) * 100.0)
 
-    summary = PerformanceSummary(
-        company_project_count=len(proj_ids),
-        company_project_score_sum=company_score_sum,
-        employee_project_count=len(projects_out),
-        employee_project_score_sum=_trunc1(emp_score_sum),
-        employee_allocated_score_sum=_trunc1(alloc_sum),
-        employee_share_percent=share,
-    )
-    return summary, projects_out
-
-def _calc_attendance(db: Session, user_id: int, start_dt: dt.datetime, end_dt: dt.datetime) -> AttendanceSummary:
-    if not _table_exists(db, "attendance_records"):
-        return AttendanceSummary()
-
-    # ENUM 안전: COALESCE(shift_type::text,'') 형태로
+@router.get("/meta/clients", response_model=List[ClientMeta])
+def list_clients(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> List[ClientMeta]:
+    _require_login(current_user)
     rows = db.execute(
         text(
             """
-            SELECT work_date AS work_date,
-                   check_in_at AS check_in_at,
-                   check_out_at AS check_out_at,
-                   COALESCE(shift_type::text, '') AS shift_type,
-                   COALESCE(is_holiday_work, false) AS is_holiday_work,
-                   COALESCE(status::text, '') AS status
-            FROM attendance_records
-            WHERE user_id = :uid
-              AND work_date >= CAST(:s AS timestamp)::date
-              AND work_date < CAST(:e AS timestamp)::date
-              AND deleted_at IS NULL
+            SELECT id, name, COALESCE(number,0) AS number
+            FROM clients
+            ORDER BY COALESCE(number, 999999) ASC, name ASC, id ASC
             """
-        ),
-        {"uid": user_id, "s": start_dt, "e": end_dt},
+        )
     ).mappings().all()
-
-    if not rows:
-        return AttendanceSummary()
-
-    # 총근무일(기록이 있는 날짜)
-    total_days = len({str(r["work_date"]) for r in rows})
-
-    # 근무시간(분)
-    total_minutes = 0
-    for r in rows:
-        ci = r.get("check_in_at")
-        co = r.get("check_out_at")
-        if ci and co:
-            try:
-                diff = (co - ci).total_seconds() / 60.0
-                if diff > 0:
-                    total_minutes += int(diff)
-            except Exception:
-                pass
-    total_hours = round(total_minutes / 60.0, 2)
-
-    office = sum(1 for r in rows if str(r.get("shift_type") or "").upper() == "OFFICE")
-    offsite = sum(1 for r in rows if str(r.get("shift_type") or "").upper() == "OUTSIDE")
-    leave = sum(1 for r in rows if str(r.get("shift_type") or "").upper() == "LEAVE")
-    half_leave = sum(1 for r in rows if "HALF" in str(r.get("shift_type") or "").upper())
-
-    holiday_work = sum(1 for r in rows if bool(r.get("is_holiday_work")))
-    overtime = sum(1 for r in rows if "OVERTIME" in str(r.get("status") or "").upper() or "OVERTIME" in str(r.get("shift_type") or "").upper())
-    extra = sum(1 for r in rows if "EXTRA" in str(r.get("status") or "").upper() or "ADDITIONAL" in str(r.get("status") or "").upper())
-
-    # 실근무일수: leave/half 제외, checkin/out 있으면 근무 인정
-    actual = 0
-    for r in rows:
-        st = str(r.get("shift_type") or "").upper()
-        if st == "LEAVE" or "HALF" in st:
-            continue
-        if r.get("check_in_at") and r.get("check_out_at"):
-            actual += 1
-
-    avg = 0.0 if actual <= 0 else round(total_hours / actual, 2)
-
-    return AttendanceSummary(
-        total_days=int(total_days),
-        actual_work_days=int(actual),
-        total_work_hours=float(total_hours),
-        avg_work_hours=float(avg),
-        office_days=int(office),
-        offsite_days=int(offsite),
-        annual_leave_days=float(leave),
-        half_leave_days=float(half_leave) * 0.5,
-        overtime_days=int(overtime),
-        holiday_work_days=int(holiday_work),
-        extra_work_days=int(extra),
-    )
+    return [ClientMeta(id=int(r["id"]), name=r["name"], number=int(r.get("number") or 0)) for r in rows]
 
 
-@router.get("/report", response_model=StaffReportOut)
-def get_staff_report(
-    unit: str = Query(..., description="month|year"),
-    date: str = Query(..., description="YYYY-MM or YYYY"),
-    user_id: int = Query(...),
+@router.get("/meta/business-types", response_model=List[BusinessTypeMeta])
+def list_business_types(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
-) -> StaffReportOut:
-    _require_admin(db, current_user)
+) -> List[BusinessTypeMeta]:
+    _require_login(current_user)
+    rows = db.execute(
+        text(
+            """
+            SELECT id, name, COALESCE(number,0) AS number
+            FROM project_business_types
+            WHERE deleted_at IS NULL AND COALESCE(is_active, true) = true
+            ORDER BY COALESCE(number, 999999) ASC, COALESCE(sort_order,0) ASC, id ASC
+            """
+        )
+    ).mappings().all()
+    return [BusinessTypeMeta(id=int(r["id"]), name=r["name"], number=int(r.get("number") or 0)) for r in rows]
 
-    start_dt, end_dt = _period_range(unit, date)
-    emp_name, dept_name = _load_employee_info(db, user_id)
 
-    perf, projects = _calc_project_performance(db, user_id, start_dt, end_dt)
-    att = _calc_attendance(db, user_id, start_dt, end_dt)
+@router.post("/meta/clients", response_model=ClientMeta)
+def create_client(
+    payload: ClientUpsert,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ClientMeta:
+    _require_admin(current_user)
 
-    return StaffReportOut(
-        unit=unit,
-        date=date,
-        user_id=int(user_id),
-        employee_name=emp_name,
-        department_name=dept_name,
-        performance=perf,
-        attendance=att,
-        projects=projects,
+    # ✅ 번호 자동 부여: 입력이 없으면 마지막 번호 + 1
+    num = int(payload.number or 0)
+    if num <= 0:
+        num = int(db.execute(text("SELECT COALESCE(MAX(number), 0) + 1 FROM clients")).scalar() or 1)
+
+    row = db.execute(
+        text(
+            """
+            INSERT INTO clients(name, number)
+            VALUES (:name, :number)
+            RETURNING id, name, COALESCE(number,0) AS number
+            """
+        ),
+        {"name": payload.name.strip(), "number": int(num),
+                "created_by": current_user.id},
+    ).mappings().first()
+    db.commit()
+    return ClientMeta(id=int(row["id"]), name=row["name"], number=int(row.get("number") or 0))
+
+
+@router.delete("/meta/clients/{client_id}")
+def delete_client(
+    client_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    _require_admin(current_user)
+    db.execute(text("DELETE FROM clients WHERE id = :id"), {"id": client_id})
+    db.commit()
+    return {"ok": True}
+
+
+@router.patch("/meta/clients/{client_id}", response_model=ClientMeta)
+def update_client(
+    client_id: int,
+    payload: ClientPatch,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ClientMeta:
+    _require_admin(current_user)
+    fields: List[str] = []
+    params: Dict[str, Any] = {"id": client_id}
+    if payload.name is not None:
+        fields.append("name = :name")
+        params["name"] = payload.name.strip()
+    if payload.number is not None:
+        fields.append("number = :number")
+        params["number"] = int(payload.number)
+    if not fields:
+        raise HTTPException(status_code=400, detail="변경할 값이 없습니다.")
+    row = db.execute(
+        text(
+            f"""
+            UPDATE clients
+            SET {', '.join(fields)}
+            WHERE id = :id
+            RETURNING id, name, COALESCE(number,0) AS number
+            """
+        ),
+        params,
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="발주처를 찾을 수 없습니다.")
+    db.commit()
+    return ClientMeta(id=int(row["id"]), name=row["name"], number=int(row.get("number") or 0))
+
+
+@router.post("/meta/business-types", response_model=BusinessTypeMeta)
+def create_business_type(
+    payload: BusinessTypeUpsert,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> BusinessTypeMeta:
+    _require_admin(current_user)
+
+    # ✅ 번호 자동 부여: 입력이 없으면 마지막 번호 + 1
+    num = int(payload.number or 0)
+    if num <= 0:
+        num = int(db.execute(text("SELECT COALESCE(MAX(number), 0) + 1 FROM project_business_types")).scalar() or 1)
+
+    row = db.execute(
+        text(
+            """
+            INSERT INTO project_business_types(name, number, sort_order, is_active, memo)
+            VALUES (:name, :number, :sort_order, :is_active, :memo)
+            RETURNING id, name, COALESCE(number,0) AS number
+            """
+        ),
+        {
+            "name": payload.name.strip(),
+            "number": int(num),
+            "sort_order": int(payload.sort_order or 0),
+            "is_active": bool(payload.is_active),
+            "memo": payload.memo,
+                    },
+    ).mappings().first()
+    db.commit()
+    return BusinessTypeMeta(id=int(row["id"]), name=row["name"], number=int(row.get("number") or 0))
+
+
+@router.delete("/meta/business-types/{bt_id}")
+def delete_business_type(
+    bt_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    _require_admin(current_user)
+    db.execute(text("UPDATE project_business_types SET deleted_at = NOW() WHERE id = :id"), {"id": bt_id})
+    db.commit()
+    return {"ok": True}
+
+
+@router.patch("/meta/business-types/{bt_id}", response_model=BusinessTypeMeta)
+def update_business_type(
+    bt_id: int,
+    payload: BusinessTypePatch,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> BusinessTypeMeta:
+    _require_admin(current_user)
+    fields: List[str] = []
+    params: Dict[str, Any] = {"id": bt_id}
+    if payload.name is not None:
+        fields.append("name = :name")
+        params["name"] = payload.name.strip()
+    if payload.number is not None:
+        fields.append("number = :number")
+        params["number"] = int(payload.number)
+    if not fields:
+        raise HTTPException(status_code=400, detail="변경할 값이 없습니다.")
+    row = db.execute(
+        text(
+            f"""
+            UPDATE project_business_types
+            SET {', '.join(fields)}
+            WHERE id = :id
+            RETURNING id, name, COALESCE(number,0) AS number
+            """
+        ),
+        params,
+    ).mappings().first()
+    if not row:
+        raise HTTPException(status_code=404, detail="사업종류를 찾을 수 없습니다.")
+    db.commit()
+    return BusinessTypeMeta(id=int(row["id"]), name=row["name"], number=int(row.get("number") or 0))
+
+
+# ----------------------
+# Projects
+# ----------------------
+
+@router.get("", response_model=List[ProjectListItem])
+def list_projects(
+    year: Optional[int] = Query(None),
+    department_id: Optional[int] = Query(None),
+    client_id: Optional[int] = Query(None),
+    name: Optional[str] = Query(None, description="명칭(사업명)"),
+    status: Optional[str] = Query(None, description="상태(enum 문자열)"),
+    q: Optional[str] = Query(None, description="추가 검색(메모 등)"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> List[ProjectListItem]:
+    _require_login(current_user)
+    y = _normalize_year(year)
+
+    where: List[str] = ["1=1"]
+    params: Dict[str, Any] = {}
+
+    if department_id is not None:
+        where.append("p.department_id = :department_id")
+        params["department_id"] = department_id
+    if client_id is not None:
+        where.append("p.client_id = :client_id")
+        params["client_id"] = client_id
+    if name:
+        where.append("p.name ILIKE :name")
+        params["name"] = f"%{name}%"
+    if status:
+        where.append("p.status = :status")
+        params["status"] = status
+    if q:
+        where.append("(p.name ILIKE :q OR COALESCE(p.memo,'') ILIKE :q)")
+        params["q"] = f"%{q}%"
+    if y is not None:
+        where.append("EXTRACT(YEAR FROM COALESCE(p.start_date, p.created_at)) = :y")
+        params["y"] = y
+
+    rows = db.execute(
+        text(
+            f"""
+            SELECT
+              p.id, p.name, p.department_id, d.name AS department_name,
+              p.client_id, c.name AS client_name,
+              p.status, COALESCE(p.has_unread_update,false) AS has_unread_update,
+              p.start_date, p.end_date, p.end_date AS due_date, p.created_at
+            FROM projects p
+            LEFT JOIN departments d ON d.id = p.department_id
+            LEFT JOIN clients c ON c.id = p.client_id
+            WHERE {' AND '.join(where)}
+            ORDER BY p.id DESC
+            """
+        ),
+        params,
+    ).mappings().all()
+
+    out: List[ProjectListItem] = []
+    for r in rows:
+        out.append(
+            ProjectListItem(
+                id=int(r["id"]),
+                name=r["name"],
+                department_id=r.get("department_id"),
+                department_name=r.get("department_name"),
+                client_id=r.get("client_id"),
+                client_name=r.get("client_name"),
+                status=str(r.get("status")),
+                has_unread_update=bool(r.get("has_unread_update")),
+                start_date=r.get("start_date"),
+                end_date=r.get("end_date"),
+                due_date=r.get("due_date"),
+                created_at=r.get("created_at"),
+            )
+        )
+    return out
+
+
+@router.post("", response_model=Dict[str, Any])
+def create_project(
+    payload: ProjectCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    user = _require_login(current_user)
+
+    rid = _role_id(user)
+    is_admin = _is_admin_by_code(db, user) or rid == ROLE_ADMIN_ID
+
+    # ✅ 부서 결정
+    dept_id = payload.department_id
+    if not is_admin:
+        user_dept_id = getattr(user, "department_id", None)
+        if user_dept_id:
+            dept_id = user_dept_id
+        else:
+            if not dept_id:
+                raise HTTPException(status_code=400, detail="부서가 설정되어 있지 않습니다. (부서를 선택하세요)")
+
+    # status 기본값
+    status = payload.status or "PLANNING"
+
+    # ✅ client_id 보정(수기 발주처 지원 + number 자동 증가)
+    client_id = payload.client_id
+    if not client_id:
+        cname = (payload.client_name or "").strip()
+        if not cname:
+            raise HTTPException(status_code=422, detail="발주처를 선택하거나 수기로 입력하세요.")
+
+        row_c = db.execute(text("SELECT id FROM clients WHERE name = :name"), {"name": cname}).first()
+        if row_c:
+            client_id = row_c[0]
+        else:
+            next_number = db.execute(text("SELECT COALESCE(MAX(number), 0) + 1 FROM clients")).scalar() or 1
+            row_c = db.execute(
+                text("INSERT INTO clients (name, number) VALUES (:name, :number) RETURNING id"),
+                {"name": cname, "number": int(next_number)},
+            ).first()
+            client_id = row_c[0]
+
+    row = db.execute(
+        text(
+            """
+            INSERT INTO projects (name, department_id, client_id, business_type_id, status, start_date, end_date, memo, has_unread_update , created_by)
+            VALUES (:name, :department_id, :client_id, :business_type_id, :status, :start_date, :end_date, :memo, false , :created_by)
+            RETURNING id
+            """
+        ),
+        {
+            "name": payload.name,
+            "department_id": dept_id,
+            "client_id": client_id,
+            "business_type_id": payload.business_type_id,
+            "status": status,
+            "start_date": payload.start_date,
+            "end_date": payload.end_date,
+            "memo": payload.memo,
+                    "created_by": user.id,
+            },
+    ).first()
+
+    db.commit()
+    return {"id": int(row[0]) if row else None}
+
+
+@router.put("/{project_id}/admin-info", response_model=Dict[str, Any])
+def update_project_admin_info(
+    project_id: int,
+    payload: ProjectAdminInfo,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    _require_admin(current_user)
+
+    exists = db.execute(text("SELECT 1 FROM projects WHERE id = :id"), {"id": project_id}).first()
+    if not exists:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
+
+    # ✅ admin-info 저장: projects 테이블에 가능한 컬럼을 모두 저장(컬럼이 없으면 조용히 skip)
+    fields: List[str] = []
+    params: Dict[str, Any] = {"id": project_id}
+
+    # ✅ 소수 1자리 절사(버림): 반올림 금지
+    def _trunc_1_decimal(value: Any) -> Any:
+        try:
+            x = float(value)
+            if x >= 0:
+                return math.floor(x * 10) / 10.0
+            # 음수도 "버림(절사)"을 0 방향으로 맞춤
+            return math.ceil(x * 10) / 10.0
+        except Exception:
+            return value
+
+    def _set_if_exists(col: str, key: str, val: Any):
+        if val is None:
+            return
+        if not _column_exists(db, "projects", col):
+            return
+        fields.append(f"{col} = :{key}")
+        params[key] = val
+
+    _set_if_exists("contract_amount", "contract_amount", payload.contract_amount)
+    _set_if_exists("project_period_days", "project_period_days", payload.project_period_days)
+    _set_if_exists("project_period", "project_period", payload.project_period.strip() if isinstance(payload.project_period, str) else payload.project_period)
+    _set_if_exists("difficulty", "difficulty", payload.difficulty)
+    _set_if_exists("progress_step", "progress_step", payload.progress_step)
+    _set_if_exists("participant_count", "participant_count", payload.participant_count)
+    
+    if payload.profit_rate is not None:
+        truncated = math.floor(float(payload.profit_rate) * 10) / 10.0 
+        _set_if_exists("profit_rate", "profit_rate", truncated)
+    
+    _set_if_exists("sales_score", "sales_score", payload.sales_score)
+    _set_if_exists("work_speed", "work_speed", payload.work_speed)
+    _set_if_exists("internal_score", "internal_score", payload.internal_score)
+    _set_if_exists("external_score", "external_score", payload.external_score)
+
+    # 확장(있으면 저장)
+    _set_if_exists("cost_progress", "cost_progress", payload.cost_progress)
+    _set_if_exists("cost_other_note", "cost_other_note", payload.cost_other_note.strip() if isinstance(payload.cost_other_note, str) else payload.cost_other_note)
+    _set_if_exists("other_note", "other_note", payload.other_note.strip() if isinstance(payload.other_note, str) else payload.other_note)
+
+    if fields:
+        db.execute(
+            text(f"UPDATE projects SET {', '.join(fields)}, updated_at = NOW() WHERE id = :id"),
+            params,
+        )
+
+    # 원가/영업비는 별도 테이블에 저장(없으면 400 안내)
+    try:
+        db.execute(
+            text(
+                """
+                INSERT INTO project_admin_finance
+                  (project_id, cost_material, cost_labor, cost_office, cost_other, sales_cost, updated_at)
+                VALUES
+                  (:id, :cost_material, :cost_labor, :cost_office, :cost_other, :sales_cost, NOW())
+                ON CONFLICT (project_id) DO UPDATE SET
+                  cost_material = EXCLUDED.cost_material,
+                  cost_labor = EXCLUDED.cost_labor,
+                  cost_office = EXCLUDED.cost_office,
+                  cost_other = EXCLUDED.cost_other,
+                  sales_cost = EXCLUDED.sales_cost,
+                  updated_at = NOW()
+                """
+            ),
+            {
+                "id": project_id,
+                "cost_material": payload.cost_material,
+                "cost_labor": payload.cost_labor,
+                "cost_office": payload.cost_office,
+                "cost_other": payload.cost_other,
+                "sales_cost": payload.sales_cost,
+            },
+        )
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "관리자 재무 테이블(project_admin_finance)이 없거나 DB 권한이 부족합니다.\n"
+                "DB에 아래 SQL을 1회 적용한 뒤 다시 저장하세요.\n\n"
+                "CREATE TABLE project_admin_finance (\n"
+                "  project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,\n"
+                "  cost_material DOUBLE PRECISION NULL,\n"
+                "  cost_labor DOUBLE PRECISION NULL,\n"
+                "  cost_office DOUBLE PRECISION NULL,\n"
+                "  cost_other DOUBLE PRECISION NULL,\n"
+                "  sales_cost DOUBLE PRECISION NULL,\n"
+                "  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n"
+                "  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n"
+                ");\n"
+                f"\n원인: {e}"
+            ),
+        ) from e
+
+    db.commit()
+    return {"ok": True}
+
+
+# ----------------------
+# Project Detail / Updates
+# ----------------------
+
+class ParticipantScoreOut(BaseModel):
+    employee_id: int
+    employee_name: Optional[str] = None
+    score: Optional[float] = None
+
+
+class ProjectDetailOut(BaseModel):
+    id: int
+    name: str
+    client_name: Optional[str] = None
+    client_id: Optional[int] = None
+    department_name: Optional[str] = None
+    business_type_name: Optional[str] = None
+    business_type_id: Optional[int] = None
+    created_by_id: Optional[int] = None
+    created_by_name: Optional[str] = None
+    cancel_reason: Optional[str] = None
+    participant_scores: Optional[List[ParticipantScoreOut]] = None
+    participant_count: Optional[int] = None
+
+    memo: Optional[str] = None
+    status: Optional[str] = None
+    created_at: Optional[dt.datetime] = None
+    has_unread_update: bool = False
+    contract_amount: Optional[float] = None
+    cost_material: Optional[float] = None
+    cost_labor: Optional[float] = None
+    cost_office: Optional[float] = None
+    cost_other: Optional[float] = None
+    sales_cost: Optional[float] = None
+
+    # ✅ 관리자 평가/점수(있으면 제공)
+    project_period_days: Optional[float] = None
+    difficulty: Optional[float] = None
+    progress_step: Optional[float] = None
+    profit_rate: Optional[float] = None
+    sales_score: Optional[float] = None
+    work_speed: Optional[float] = None
+    internal_score: Optional[float] = None
+    external_score: Optional[float] = None
+
+
+class ProjectUpdateCreate(BaseModel):
+    content: str = Field(..., min_length=1)
+
+
+class ProjectUpdateOut(BaseModel):
+    id: int
+    content: str
+    created_at: dt.datetime
+    created_by_name: Optional[str] = None
+    department_name: Optional[str] = None
+
+
+@router.get("/{project_id}", response_model=ProjectDetailOut)
+def get_project_detail(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> ProjectDetailOut:
+    _require_login(current_user)
+
+    # finance 테이블이 없거나 권한이 부족해도 상세조회는 살아야 함
+    # ✅ 점수 컬럼은 DB마다 없을 수 있어, 컬럼 존재 시에만 SELECT에 포함
+    score_cols = []
+    if _column_exists(db, 'projects', 'project_period_days'):
+        score_cols.append("p.project_period_days AS project_period_days")
+    if _column_exists(db, 'projects', 'difficulty'):
+        score_cols.append("p.difficulty AS difficulty")
+    if _column_exists(db, 'projects', 'progress_step'):
+        score_cols.append("p.progress_step AS progress_step")
+    if _column_exists(db, 'projects', 'profit_rate'):
+        score_cols.append("p.profit_rate AS profit_rate")
+    if _column_exists(db, 'projects', 'sales_score'):
+        score_cols.append("p.sales_score AS sales_score")
+    if _column_exists(db, 'projects', 'work_speed'):
+        score_cols.append("p.work_speed AS work_speed")
+    if _column_exists(db, 'projects', 'internal_score'):
+        score_cols.append("p.internal_score AS internal_score")
+    if _column_exists(db, 'projects', 'external_score'):
+        score_cols.append("p.external_score AS external_score")
+
+    score_sql = (",\n                  " + ",\n                  ".join(score_cols)) if score_cols else ""
+    try:
+        r = db.execute(
+            text(
+                f"""
+                SELECT
+                  p.id, p.name, p.memo, p.status, p.created_at,
+                  COALESCE(p.has_unread_update,false) AS has_unread_update,
+                  p.client_id AS client_id,
+                  c.name AS client_name,
+                  d.name AS department_name,
+                  p.business_type_id AS business_type_id,
+                  bt.name AS business_type_name,
+                  p.created_by AS created_by_id,
+                  u.name AS created_by_name,
+                  p.contract_amount AS contract_amount{score_sql},
+                  f.cost_material AS cost_material,
+                  f.cost_labor AS cost_labor,
+                  f.cost_office AS cost_office,
+                  f.cost_other AS cost_other,
+                  f.sales_cost AS sales_cost
+                FROM projects p
+                LEFT JOIN clients c ON c.id = p.client_id
+                LEFT JOIN departments d ON d.id = p.department_id
+                LEFT JOIN project_business_types bt ON bt.id = p.business_type_id
+                LEFT JOIN users u ON u.id = p.created_by
+                LEFT JOIN project_admin_finance f ON f.project_id = p.id
+                WHERE p.id = :id
+                """
+            ),
+            {"id": project_id},
+        ).mappings().first()
+    except Exception:
+        r = db.execute(
+            text(
+                """
+                SELECT
+                  p.id, p.name, p.memo, p.status, p.created_at,
+                  COALESCE(p.has_unread_update,false) AS has_unread_update,
+                  p.client_id AS client_id,
+                  c.name AS client_name,
+                  d.name AS department_name,
+                  p.business_type_id AS business_type_id,
+                  bt.name AS business_type_name,
+                  p.created_by AS created_by_id,
+                  u.name AS created_by_name,
+                  p.contract_amount AS contract_amount{score_sql}
+                FROM projects p
+                LEFT JOIN clients c ON c.id = p.client_id
+                LEFT JOIN departments d ON d.id = p.department_id
+                LEFT JOIN project_business_types bt ON bt.id = p.business_type_id
+                LEFT JOIN users u ON u.id = p.created_by
+                WHERE p.id = :id
+                """
+            ),
+            {"id": project_id},
+        ).mappings().first()
+
+    if not r:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
+
+    # 점수 표시 권한: 관리자 또는 등록자(created_by)
+    can_view_scores = _is_admin_by_code(db, current_user)
+    try:
+        if not can_view_scores:
+            created_by_id = r.get("created_by_id")
+            if created_by_id is not None and int(created_by_id) == int(current_user.id):
+                can_view_scores = True
+    except Exception:
+        pass
+
+    scores = _get_participant_scores(db, int(project_id), can_view_scores, project_status=r.get("status"))
+    return ProjectDetailOut(
+        id=int(r["id"]),
+        name=r["name"],
+        memo=r.get("memo"),
+        status=r.get("status"),
+        created_at=r.get("created_at"),
+        has_unread_update=bool(r.get("has_unread_update")),
+        client_name=r.get("client_name"),
+        department_name=r.get("department_name"),
+        business_type_name=r.get("business_type_name"),
+        contract_amount=r.get("contract_amount"),
+        cost_material=r.get("cost_material"),
+        cost_labor=r.get("cost_labor"),
+        cost_office=r.get("cost_office"),
+        cost_other=r.get("cost_other"),
+        sales_cost=r.get("sales_cost"),
+        project_period_days=r.get("project_period_days"),
+        difficulty=r.get("difficulty"),
+        progress_step=r.get("progress_step"),
+        profit_rate=r.get("profit_rate"),
+        sales_score=r.get("sales_score"),
+        work_speed=r.get("work_speed"),
+        internal_score=r.get("internal_score"),
+        external_score=r.get("external_score"),
+        client_id=r.get("client_id"),
+        business_type_id=r.get("business_type_id"),
+        created_by_id=r.get("created_by_id"),
+        created_by_name=r.get("created_by_name"),
+        cancel_reason=_get_cancel_reason(db, int(project_id)),
+        participant_scores=scores,
+        participant_count=len(scores),
     )
+
+
+
+@router.get("/{project_id}/updates", response_model=List[ProjectUpdateOut])
+def list_project_updates(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> List[ProjectUpdateOut]:
+    _require_login(current_user)
+    rows = db.execute(
+        text(
+            """
+            SELECT
+              u.id,
+              u.content,
+              u.created_at,
+              usr.name AS created_by_name,
+              d.name AS department_name
+            FROM project_updates u
+            LEFT JOIN users usr ON usr.id = u.created_by
+            LEFT JOIN departments d ON d.id = u.department_id
+            WHERE u.project_id = :pid
+            ORDER BY u.id DESC
+            """
+        ),
+        {"pid": project_id},
+    ).mappings().all()
+
+    return [
+        ProjectUpdateOut(
+            id=int(r["id"]),
+            content=r["content"],
+            created_at=r["created_at"],
+            created_by_name=r.get("created_by_name"),
+            department_name=r.get("department_name"),
+        )
+        for r in rows
+    ]
+
+
+@router.post("/{project_id}/updates", response_model=Dict[str, Any])
+def create_project_update(
+    project_id: int,
+    payload: ProjectUpdateCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    user = _require_login(current_user)
+
+    exists = db.execute(text("SELECT 1 FROM projects WHERE id = :id"), {"id": project_id}).scalar()
+    if not exists:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
+
+    dept_id = getattr(user, "department_id", None)
+    row = db.execute(
+        text(
+            """
+            INSERT INTO project_updates (project_id, content, created_by, department_id, created_at)
+            VALUES (:pid, :content, :uid, :dept_id, NOW())
+            RETURNING id
+            """
+        ),
+        {"pid": project_id, "content": payload.content.strip(), "uid": user.id, "dept_id": dept_id},
+    ).first()
+
+    db.execute(text("UPDATE projects SET has_unread_update = true WHERE id = :id"), {"id": project_id})
+    db.commit()
+    return {"id": int(row[0]) if row else None, "ok": True}
+
+
+
+@router.put("/{project_id}/updates/{update_id}", response_model=Dict[str, Any])
+def update_project_update(
+    project_id: int,
+    update_id: int,
+    payload: ProjectUpdateCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """프로젝트 진행내용 수정.
+    정책:
+    - 관리자(ROLE_ADMIN_ID=6 또는 roles.code=ADMIN) 또는 프로젝트 등록자(created_by)만 수정 가능
+    """
+    user = _require_login(current_user)
+
+    # 프로젝트 존재 확인
+    exists = db.execute(text("SELECT 1 FROM projects WHERE id = :id"), {"id": project_id}).scalar()
+    if not exists:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
+
+    # 권한 확인
+    if not _can_edit_project(db, project_id, user):
+        raise HTTPException(status_code=403, detail="수정 권한이 없습니다.")
+
+    # 업데이트 존재/소속 확인
+    row = db.execute(
+        text(
+            """
+            SELECT id
+            FROM project_updates
+            WHERE id = :uid AND project_id = :pid
+            """
+        ),
+        {"uid": update_id, "pid": project_id},
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="진행내용을 찾을 수 없습니다.")
+
+    # 내용 수정
+    try:
+        db.execute(
+            text(
+                """
+                UPDATE project_updates
+                SET content = :content, created_at = NOW()
+                WHERE id = :uid AND project_id = :pid
+                """
+            ),
+            {"content": payload.content.strip(), "uid": update_id, "pid": project_id},
+        )
+    except Exception:
+        # updated_at 컬럼이 있는 경우를 대비 (있으면 자동 갱신)
+        try:
+            db.execute(
+                text(
+                    """
+                    UPDATE project_updates
+                    SET content = :content, updated_at = NOW(), created_at = NOW()
+                    WHERE id = :uid AND project_id = :pid
+                    """
+                ),
+                {"content": payload.content.strip(), "uid": update_id, "pid": project_id},
+            )
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"진행내용 수정 실패: {e}") from e
+
+    # 수정도 '미확인'으로 처리(관리자 확인 프로세스 유지)
+    try:
+        db.execute(text("UPDATE projects SET has_unread_update = true WHERE id = :id"), {"id": project_id})
+    except Exception:
+        pass
+
+    db.commit()
+    return {"ok": True, "id": int(update_id)}
+
+
+@router.delete("/{project_id}/updates/{update_id}", response_model=Dict[str, Any])
+def delete_project_update(
+    project_id: int,
+    update_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """프로젝트 진행내용 삭제.
+    - 관리자(ROLE_ADMIN_ID=6) 또는 프로젝트 등록자(created_by)만 삭제 가능
+    """
+    user = _require_login(current_user)
+
+    # 프로젝트 존재 확인
+    exists = db.execute(text("SELECT 1 FROM projects WHERE id = :id"), {"id": project_id}).scalar()
+    if not exists:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
+
+    # 권한 확인
+    if not _can_edit_project(db, project_id, user):
+        raise HTTPException(status_code=403, detail="삭제 권한이 없습니다.")
+
+    # 업데이트 존재/소속 확인
+    row = db.execute(
+        text("SELECT id FROM project_updates WHERE id = :uid AND project_id = :pid"),
+        {"uid": update_id, "pid": project_id},
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="진행내용을 찾을 수 없습니다.")
+
+    try:
+        db.execute(
+            text("DELETE FROM project_updates WHERE id = :uid AND project_id = :pid"),
+            {"uid": update_id, "pid": project_id},
+        )
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"진행내용 삭제 실패: {e}") from e
+
+    return {"ok": True, "id": int(update_id)}
+
+
+
+@router.post("/{project_id}/admin-ack", response_model=Dict[str, Any])
+def admin_ack_project(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """관리자 내용확인(ACK)
+    - 관리자만 가능
+    - projects.has_unread_update=false 로 초기화
+    - '마지막 확인 시각'을 전 직원이 공유할 수 있도록 project_updates에 ACK 마커를 남김
+      * project_updates 컬럼명은 기존 INSERT 로직과 동일하게 사용(created_by, department_id, created_at)
+    """
+    _require_admin(current_user)
+
+    # 프로젝트 존재/부서 확인
+    proj = db.execute(text("SELECT id, department_id FROM projects WHERE id = :id"), {"id": project_id}).first()
+    if not proj:
+        raise HTTPException(status_code=404, detail="프로젝트를 찾을 수 없습니다.")
+
+    dept_id = proj[1] if len(proj) > 1 else None
+    uid = int(getattr(current_user, "id", 0) or 0)
+
+    # 1) unread 해제
+    db.execute(text("UPDATE projects SET has_unread_update = false WHERE id = :id"), {"id": project_id})
+
+    # 2) ACK 마커 업데이트 추가
+    try:
+        db.execute(
+            text(
+                """
+                INSERT INTO project_updates (project_id, content, created_by, department_id, created_at)
+                VALUES (:pid, :content, :uid, :dept_id, NOW())
+                """
+            ),
+            {"pid": project_id, "content": "[관리자확인]", "uid": uid, "dept_id": dept_id},
+        )
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"관리자 확인 기록 실패: {e}") from e
+
+    db.commit()
+    return {"ok": True}
+
+
+
+# ==============================================
+# 상태 변경: 완료/취소/다시진행
+# ==============================================
+
+class ProjectCompleteParticipant(BaseModel):
+    employee_id: int
+    score: float = Field(..., ge=0)
+
+
+class ProjectCompletePayload(BaseModel):
+    participants: List[ProjectCompleteParticipant]
+
+
+class ProjectCancelPayload(BaseModel):
+    reason: str = Field(..., min_length=1)
+
+
+def _table_exists(db: Session, table_name: str) -> bool:
+    # Postgres 기준: to_regclass 사용
+    try:
+        return db.execute(text("SELECT to_regclass(:t) IS NOT NULL"), {"t": f"public.{table_name}"}).scalar() is True
+    except Exception:
+        return False
+
+
+def _column_exists(db: Session, table_name: str, column_name: str) -> bool:
+    try:
+        q = text(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema='public' AND table_name=:t AND column_name=:c
+            LIMIT 1
+            """
+        )
+        return db.execute(q, {"t": table_name, "c": column_name}).first() is not None
+    except Exception:
+        return False
+
+
+def _is_completed_status(status: Optional[str]) -> bool:
+    s = (status or "").strip().upper()
+    return s in {"DONE", "COMPLETED", "COMPLETE", "FINISHED", "CLOSED"}
+
+
+def _table_columns(db: Session, table_name: str) -> set[str]:
+    try:
+        rows = db.execute(
+            text(
+                '''
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema='public' AND table_name=:t
+                '''
+            ),
+            {"t": table_name},
+        ).fetchall()
+        return {str(r[0]) for r in (rows or [])}
+    except Exception:
+        return set()
+
+
+def _save_project_snapshot(db: Session, project_id: int, *, action: str, actor_user_id: int, note: Optional[str] = None) -> None:
+    """프로젝트 스냅샷 저장(있으면 저장, 없으면 조용히 skip).
+    - 기존 로직/테이블을 강제 생성하지 않음.
+    - 지원 테이블 후보(존재하는 것 1개만 사용):
+      1) project_snapshots
+      2) project_status_snapshots
+      3) project_completion_snapshots
+    """
+    table = None
+    for t in ("project_snapshots", "project_status_snapshots", "project_completion_snapshots"):
+        if _table_exists(db, t):
+            table = t
+            break
+    if not table:
+        return
+
+    cols = _table_columns(db, table)
+    if not cols:
+        return
+
+    # 1) project row
+    proj = {}
+    try:
+        r = db.execute(text("SELECT * FROM projects WHERE id = :id"), {"id": project_id}).mappings().first()
+        proj = dict(r) if r else {}
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        proj = {}
+
+    # 2) participants
+    participants = []
+    try:
+        if _table_exists(db, "project_evaluations"):
+            participants = [
+                {"user_id": int(x["user_id"]), "score": float(x["score"]) if x["score"] is not None else None}
+                for x in (
+                    db.execute(
+                        text("SELECT user_id, score FROM project_evaluations WHERE project_id = :id ORDER BY user_id ASC"),
+                        {"id": project_id},
+                    ).mappings().all()
+                    or []
+                )
+            ]
+        elif _table_exists(db, "project_participants"):
+            participants = [
+                {"employee_id": int(x["employee_id"]), "score": float(x["score"]) if x["score"] is not None else None}
+                for x in (
+                    db.execute(
+                        text("SELECT employee_id, score FROM project_participants WHERE project_id = :id ORDER BY employee_id ASC"),
+                        {"id": project_id},
+                    ).mappings().all()
+                    or []
+                )
+            ]
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        participants = []
+
+    # 3) finance (optional)
+    finance = {}
+    try:
+        if _table_exists(db, "project_admin_finance"):
+            fr = db.execute(
+                text("SELECT * FROM project_admin_finance WHERE project_id = :id"),
+                {"id": project_id},
+            ).mappings().first()
+            finance = dict(fr) if fr else {}
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        finance = {}
+
+    snapshot = {
+        "project": proj,
+        "participants": participants,
+        "finance": finance,
+        "note": note,
+    }
+
+    # 스냅샷 컬럼 후보
+    snapshot_col = None
+    for c in ("snapshot", "data", "payload", "snapshot_json"):
+        if c in cols:
+            snapshot_col = c
+            break
+    if not snapshot_col:
+        return
+
+    # status 컬럼 후보
+    status_val = str(proj.get("status") or "")
+    status_col = None
+    for c in ("status", "project_status", "new_status"):
+        if c in cols:
+            status_col = c
+            break
+
+    # actor/created_by 컬럼 후보
+    actor_col = None
+    for c in ("created_by", "actor_user_id", "user_id"):
+        if c in cols:
+            actor_col = c
+            break
+
+    # action 컬럼 후보
+    action_col = None
+    for c in ("action", "event", "type"):
+        if c in cols:
+            action_col = c
+            break
+
+    # created_at 컬럼 후보 (없으면 DEFAULT 기대)
+    created_at_col = "created_at" if "created_at" in cols else None
+
+    # project_id 컬럼 후보
+    pid_col = "project_id" if "project_id" in cols else ("pid" if "pid" in cols else None)
+    if not pid_col:
+        return
+
+    insert_cols = [pid_col, snapshot_col]
+    params = {"pid": project_id, "snapshot": json.dumps(snapshot, ensure_ascii=False, default=str)}
+
+    if status_col:
+        insert_cols.append(status_col)
+        params["status"] = status_val
+    if actor_col:
+        insert_cols.append(actor_col)
+        params["actor"] = int(actor_user_id)
+    if action_col:
+        insert_cols.append(action_col)
+        params["action"] = str(action)
+    if created_at_col:
+        insert_cols.append(created_at_col)
+        # 대부분 now() default가 있지만, 있으면 명시
+        params["created_at"] = dt.datetime.now(dt.timezone.utc)
+
+    # values placeholders
+    ph = []
+    for c in insert_cols:
+        if c == pid_col:
+            ph.append(":pid")
+        elif c == snapshot_col:
+            ph.append(":snapshot")
+        elif c == status_col:
+            ph.append(":status")
+        elif c == actor_col:
+            ph.append(":actor")
+        elif c == action_col:
+            ph.append(":action")
+        elif c == created_at_col:
+            ph.append(":created_at")
+
+    try:
+        db.execute(
+            text(f"INSERT INTO {table} ({', '.join(insert_cols)}) VALUES ({', '.join(ph)})"),
+            params,
+        )
+    except Exception:
+        # 스냅샷 실패는 완료 처리에 영향 주지 않음
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return
+
+
+def _save_project_completion_scores_snapshot(
+    db: Session,
+    project_id: int,
+    *,
+    completed_by: int,
+    participants: List[Dict[str, Any]],
+) -> Optional[int]:
+    """사업완료 시점의 '직원 평가점수' 및 '프로젝트 총점'을 스냅샷 테이블에 저장.
+    - 테이블이 없으면 조용히 skip.
+    - 정책: 프로젝트당 활성(is_active=true) 스냅샷은 1개를 유지(기존 active는 false로 전환 후 신규 생성).
+    - (추가) project_completion_snapshot_items.update_count 컬럼이 있으면 '사업진행내용(project_updates) 작성자별 추가 횟수'를 함께 저장.
+    """
+    if not (_table_exists(db, "project_completion_snapshots") and _table_exists(db, "project_completion_snapshot_items")):
+        return None
+
+    snap_cols = _table_columns(db, "project_completion_snapshots") or []
+    item_cols = _table_columns(db, "project_completion_snapshot_items") or []
+    required_snap = {"project_id", "final_project_score", "completed_at", "is_active"}
+    required_item = {"snapshot_id", "user_id", "user_eval_score", "converted_score", "created_at"}
+    if not required_snap.issubset(set(snap_cols)) or not required_item.issubset(set(item_cols)):
+        return None
+
+    # (옵션) 사업진행내용 작성자별 추가 횟수 카운트 맵
+    update_count_by_user: Dict[int, int] = {}
+    if "update_count" in set(item_cols) and _table_exists(db, "project_updates"):
+        try:
+            rows = db.execute(
+                text(
+                    """
+                    SELECT created_by AS user_id, COUNT(*)::int AS cnt
+                    FROM project_updates
+                    WHERE project_id = :pid AND deleted_at IS NULL
+                    GROUP BY created_by
+                    """
+                ),
+                {"pid": project_id},
+            ).fetchall()
+            update_count_by_user = {int(r.user_id): int(r.cnt) for r in (rows or [])}
+        except Exception:
+            update_count_by_user = {}
+
+    # total score: converted_score 합계(기존 로직 유지)
+    safe_parts = []
+    total = 0.0
+    for p in participants or []:
+        uid = int(p.get("user_id") or p.get("employee_id") or 0)
+        score = float(p.get("score") if p.get("score") is not None else p.get("user_eval_score") or 0.0)
+        conv = float(p.get("converted_score") if p.get("converted_score") is not None else score)
+        if uid <= 0:
+            continue
+        safe_parts.append(
+            {
+                "user_id": uid,
+                "user_eval_score": score,
+                "converted_score": conv,
+                "update_count": int(update_count_by_user.get(uid, 0)),
+            }
+        )
+        total += conv
+
+    # 1) 기존 active 스냅샷 비활성화
+    try:
+        db.execute(
+            text(
+                """
+                UPDATE project_completion_snapshots
+                SET is_active = false
+                WHERE project_id = :pid AND is_active = true
+                """
+            ),
+            {"pid": project_id},
+        )
+    except Exception:
+        # 비활성화 실패는 이후 insert를 막지 않음(단, 유니크 인덱스가 있으면 insert에서 걸릴 수 있음)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+    # 2) 신규 스냅샷 생성
+    snapshot_id = None
+    try:
+        if "completed_by" in snap_cols:
+            r = db.execute(
+                text(
+                    """
+                    INSERT INTO project_completion_snapshots (project_id, final_project_score, completed_by, completed_at, is_active)
+                    VALUES (:pid, :total, :by, NOW(), true)
+                    RETURNING id
+                    """
+                ),
+                {"pid": project_id, "total": float(total), "by": int(completed_by)},
+            ).scalar()
+        else:
+            r = db.execute(
+                text(
+                    """
+                    INSERT INTO project_completion_snapshots (project_id, final_project_score, completed_at, is_active)
+                    VALUES (:pid, :total, NOW(), true)
+                    RETURNING id
+                    """
+                ),
+                {"pid": project_id, "total": float(total)},
+            ).scalar()
+        snapshot_id = int(r) if r is not None else None
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
+
+    if not snapshot_id:
+        return None
+
+    # 3) item 저장
+    try:
+        if "update_count" in set(item_cols):
+            for sp in safe_parts:
+                db.execute(
+                    text(
+                        """
+                        INSERT INTO project_completion_snapshot_items
+                          (snapshot_id, user_id, user_eval_score, converted_score, update_count, created_at)
+                        VALUES
+                          (:sid, :uid, :score, :conv, :ucnt, NOW())
+                        """
+                    ),
+                    {
+                        "sid": snapshot_id,
+                        "uid": int(sp["user_id"]),
+                        "score": float(sp["user_eval_score"]),
+                        "conv": float(sp["converted_score"]),
+                        "ucnt": int(sp.get("update_count") or 0),
+                    },
+                )
+        else:
+            for sp in safe_parts:
+                db.execute(
+                    text(
+                        """
+                        INSERT INTO project_completion_snapshot_items
+                          (snapshot_id, user_id, user_eval_score, converted_score, created_at)
+                        VALUES
+                          (:sid, :uid, :score, :conv, NOW())
+                        """
+                    ),
+                    {
+                        "sid": snapshot_id,
+                        "uid": int(sp["user_id"]),
+                        "score": float(sp["user_eval_score"]),
+                        "conv": float(sp["converted_score"]),
+                    },
+                )
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return None
+
+    return snapshot_id
+
+
+@router.post("/{project_id}/complete", response_model=Dict[str, Any])
+def complete_project(
+    project_id: int,
+    payload: ProjectCompletePayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    user = _require_login(current_user)
+    # 권한: ADMIN 또는 등록자(created_by)만
+    is_admin = _is_admin_by_code(db, user)
+    created_by = db.execute(text("SELECT created_by FROM projects WHERE id = :id"), {"id": project_id}).scalar()
+    if not is_admin and int(created_by or 0) != int(user.id):
+        raise HTTPException(status_code=403, detail="권한이 없습니다.")
+
+    # ✅ 재완료 판단(이미 완료 상태였던 프로젝트를 다시 완료 처리하는 경우)
+    prev_status = db.execute(text("SELECT status FROM projects WHERE id = :id"), {"id": project_id}).scalar()
+    was_completed = _is_completed_status(str(prev_status or ""))
+
+    # DB enum(project_status)에 맞는 완료 상태 자동 선택
+    new_status = _pick_status(db, ["COMPLETED", "DONE", "FINISHED", "COMPLETE", "CLOSED"], fallback="DONE")
+
+    # 프로젝트 상태 업데이트
+    db.execute(
+        text("""
+            UPDATE projects
+            SET status = :new_status,
+                end_date = COALESCE(end_date, CURRENT_DATE),
+                updated_at = NOW()
+            WHERE id = :id
+        """),
+        {"id": project_id, "new_status": new_status},
+    )
+
+    # 참여자 점수 저장
+    if _table_exists(db, "project_evaluations"):
+        # 정식 테이블(유저 기반) 저장: 기존 삭제 후 재삽입
+        db.execute(text("DELETE FROM project_evaluations WHERE project_id = :id"), {"id": project_id})
+        # created_by NOT NULL 대응
+        has_created_by = db.execute(text("""
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_name = 'project_evaluations' AND column_name = 'created_by'
+            LIMIT 1
+        """)).first() is not None
+
+        for p in payload.participants:
+            if has_created_by:
+                db.execute(
+                    text(
+                        """
+                        INSERT INTO project_evaluations (project_id, user_id, score, created_by, created_at)
+                        VALUES (:pid, :uid, :score, :created_by, NOW())
+                        """
+                    ),
+                    {"pid": project_id, "uid": int(p.employee_id), "score": p.score, "created_by": current_user.id},
+                )
+            else:
+                db.execute(
+                    text(
+                        """
+                        INSERT INTO project_evaluations (project_id, user_id, score, created_at)
+                        VALUES (:pid, :uid, :score, NOW())
+                        """
+                    ),
+                    {"pid": project_id, "uid": int(p.employee_id), "score": p.score},
+                )
+
+        # 혼선 방지: 기존 [평가점수] 로그는 남기지 않음(있으면 제거)
+        try:
+            if _table_exists(db, "project_updates"):
+                db.execute(
+                    text("DELETE FROM project_updates WHERE project_id = :pid AND content LIKE '[평가점수] %'"),
+                    {"pid": project_id},
+                )
+        except Exception:
+            pass
+    elif _table_exists(db, "project_participants"):
+        # 하위 호환(직원 기반)
+        db.execute(text("DELETE FROM project_participants WHERE project_id = :id"), {"id": project_id})
+        for p in payload.participants:
+            db.execute(
+                text(
+                    """
+                    INSERT INTO project_participants (project_id, employee_id, score, created_at)
+                    VALUES (:pid, :eid, :score, NOW())
+                    """
+                ),
+                {"pid": project_id, "eid": p.employee_id, "score": p.score},
+            )
+    else:
+        # legacy fallback: project_updates에 JSON으로 남김(표시/검증용) - 가능하면 사용하지 않음
+        try:
+            if _table_exists(db, "project_updates"):
+                payload_json = json.dumps(
+                    [{"employee_id": p.employee_id, "score": p.score} for p in payload.participants],
+                    ensure_ascii=False,
+                )
+                db.execute(
+                    text(
+                        "INSERT INTO project_updates (project_id, content, created_at, created_by) VALUES (:pid, :content, NOW(), :uid)"
+                    ),
+                    {"pid": project_id, "content": f"[평가점수] {payload_json}", "uid": user.id},
+                )
+        except Exception:
+            pass
+
+    # ✅ 재완료 시 비활성화 처리(is_active=false) — 컬럼이 있을 때만
+    if was_completed and _column_exists(db, "projects", "is_active"):
+        try:
+            db.execute(text("UPDATE projects SET is_active = false, updated_at = NOW() WHERE id = :id"), {"id": project_id})
+        except Exception:
+            try:
+                db.execute(text("UPDATE projects SET is_active = false WHERE id = :id"), {"id": project_id})
+            except Exception:
+                pass
+
+
+    # ✅ 사업완료 점수 스냅샷 저장(직원 평가점수 + 프로젝트 총점) — 테이블이 있을 때만
+    _save_project_completion_scores_snapshot(
+        db,
+        int(project_id),
+        completed_by=int(user.id),
+        participants=[{"user_id": int(p.employee_id), "score": float(p.score)} for p in (payload.participants or [])],
+    )
+
+    # ✅ 스냅샷 저장(테이블이 있을 때만)
+    _save_project_snapshot(
+        db,
+        int(project_id),
+        action=("RECOMPLETE" if was_completed else "COMPLETE"),
+        actor_user_id=int(user.id),
+        note="사업완료 처리",
+    )
+
+
+
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/{project_id}/cancel", response_model=Dict[str, Any])
+def cancel_project(
+    project_id: int,
+    payload: ProjectCancelPayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    user = _require_login(current_user)
+    is_admin = _is_admin_by_code(db, user)
+    created_by = db.execute(text("SELECT created_by FROM projects WHERE id = :id"), {"id": project_id}).scalar()
+    if not is_admin and int(created_by or 0) != int(user.id):
+        raise HTTPException(status_code=403, detail="권한이 없습니다.")
+
+    # DB enum(project_status)에 맞는 취소 상태 자동 선택
+    new_status = _pick_status(db, ["CANCELLED", "CANCELED", "CANCEL", "ABORTED", "STOPPED"], fallback="CANCELLED")
+
+    # 취소 사유 컬럼이 있으면 저장, 없으면 상태만 변경
+    if _column_exists(db, "projects", "cancel_reason"):
+        db.execute(
+            text("""
+                UPDATE projects
+                SET status = :new_status,
+                    cancel_reason = :r,
+                    updated_at = NOW()
+                WHERE id = :id
+            """),
+            {"id": project_id, "r": payload.reason, "new_status": new_status},
+        )
+    else:
+        db.execute(
+            text("""
+                UPDATE projects
+                SET status = :new_status,
+                    updated_at = NOW()
+                WHERE id = :id
+            """),
+            {"id": project_id, "new_status": new_status},
+        )
+        # cancel_reason 컬럼이 없는 DB에서는 project_updates에 사유를 남긴다.
+        if _table_exists(db, "project_updates"):
+            try:
+                dept_id = getattr(user, "department_id", None)
+                db.execute(
+                    text("""
+                        INSERT INTO project_updates (project_id, content, created_by, department_id, created_at)
+                        VALUES (:pid, :content, :uid, :dept_id, NOW())
+                    """),
+                    {"pid": project_id, "content": f"[취소사유] {payload.reason}", "uid": user.id, "dept_id": dept_id},
+                )
+            except Exception:
+                pass
+    db.commit()
+    return {"ok": True}
+
+
+@router.post("/{project_id}/reopen", response_model=Dict[str, Any])
+def reopen_project(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    user = _require_login(current_user)
+    is_admin = _is_admin_by_code(db, user)
+    created_by = db.execute(text("SELECT created_by FROM projects WHERE id = :id"), {"id": project_id}).scalar()
+    if not is_admin and int(created_by or 0) != int(user.id):
+        raise HTTPException(status_code=403, detail="권한이 없습니다.")
+
+    # ✅ 대표님 기준 상태값 고정: PLANNING / IN_PROGRESS / ON_HOLD / DONE / CLOSED
+    # "다시 진행"은 무조건 DONE → IN_PROGRESS 로 복귀해야 함.
+    new_status = "IN_PROGRESS"
+
+    # ✅ 1) 상태 복구를 먼저 확정(COMMIT)하여, 이후 정리 로직 실패로 롤백되는 것을 원천 차단
+    set_parts = ["status = :new_status"]
+    params: Dict[str, Any] = {"id": project_id, "new_status": new_status}
+    if _column_exists(db, "projects", "cancel_reason"):
+        set_parts.append("cancel_reason = NULL")
+    if _column_exists(db, "projects", "end_date"):
+        # 완료 흔적 제거(일부 화면이 end_date로 완료 판정하는 경우 방지)
+        set_parts.append("end_date = NULL")
+    if _column_exists(db, "projects", "updated_at"):
+        set_parts.append("updated_at = NOW()")
+
+    db.execute(
+        text(f"UPDATE projects SET {', '.join(set_parts)} WHERE id = :id"),
+        params,
+    )
+    db.commit()  # ✅ 상태 변경을 여기서 확정
+
+    # 참여자/평가 초기화
+    if _table_exists(db, "project_evaluations"):
+        db.execute(text("DELETE FROM project_evaluations WHERE project_id = :id"), {"id": project_id})
+        # created_by NOT NULL 대응
+        has_created_by = db.execute(text("""
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_name = 'project_evaluations' AND column_name = 'created_by'
+            LIMIT 1
+        """)).first() is not None
+
+    if _table_exists(db, "project_participants"):
+        db.execute(text("DELETE FROM project_participants WHERE project_id = :id"), {"id": project_id})
+    # legacy 평가 로그 제거(유령 참여자수 방지)
+    try:
+        if _table_exists(db, "project_updates"):
+            db.execute(
+                text("DELETE FROM project_updates WHERE project_id = :pid AND content LIKE '[평가점수] %'"),
+                {"pid": project_id},
+            )
+    except Exception:
+        pass
+
+    # ✅ 사업완료 스냅샷 정리(직원관리 '완료 프로젝트'는 "현재 완료 상태"만 보여야 함)
+    # - 운영관리/직원관리 집계가 project_completion_snapshots를 사용할 때,
+    #   과거 완료 이력이 남아 있으면(또는 is_active 필터가 없으면) 완료 목록/합계에 계속 잡힐 수 있음.
+    # - 따라서 "다시 진행" 시 해당 프로젝트의 완료 스냅샷을 전부 제거한다.
+    try:
+        if _table_exists(db, "project_completion_snapshots"):
+            # items 먼저 삭제 (FK 안전)
+            if _table_exists(db, "project_completion_snapshot_items"):
+                db.execute(
+                    text(
+                        """
+                        DELETE FROM project_completion_snapshot_items
+                        WHERE snapshot_id IN (
+                            SELECT id FROM project_completion_snapshots WHERE project_id = :pid
+                        )
+                        """
+                    ),
+                    {"pid": project_id},
+                )
+            # snapshots 삭제
+            db.execute(
+                text("DELETE FROM project_completion_snapshots WHERE project_id = :pid"),
+                {"pid": project_id},
+            )
+    except Exception:
+        # ✅ 여기서 rollback을 해도, 앞에서 status는 이미 commit되어 안전함
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+    # 정리 작업은 가능하면 반영
+    try:
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    return {"ok": True}
+
+
+   
+@router.delete("/{project_id}")
+def delete_project(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # 관리자만 허용 (대표님 기준 role_id == 6)
+    if current_user.role_id != 6:
+        raise HTTPException(status_code=403, detail="관리자만 삭제할 수 있습니다.")
+
+    # (선택) 프로젝트명 확보: 프로젝트 삭제 후에도 견적서 제목이 유지되게 하기 위함
+    proj_row = db.execute(
+        text("SELECT name FROM projects WHERE id = :pid"),
+        {"pid": project_id},
+    ).fetchone()
+    project_name = (proj_row[0] if proj_row else None)
+
+    # 1) 해당 프로젝트에 연결된 견적서가 있으면 '사업취소'로 전환 + 프로젝트 연결 해제
+    #    (projects 삭제 시 FK(estimates.project_id_fkey) 위반 방지)
+    db.execute(
+        text(
+            """
+            UPDATE estimates
+            SET business_state = 'CANCELED',
+                project_id = NULL,
+                title = COALESCE(title, :pname)
+            WHERE project_id = :pid
+            """
+        ),
+        {"pid": project_id, "pname": project_name},
+    )
+
+    # 2) 프로젝트 삭제
+    db.execute(
+        text("DELETE FROM projects WHERE id = :pid"),
+        {"pid": project_id},
+    )
+
+    db.commit()
+    return {"result": "ok"}
